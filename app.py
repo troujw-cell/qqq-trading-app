@@ -31,9 +31,21 @@ or_high = opening["High"].max()
 or_low = opening["Low"].min()
 
 # VWAP
-data['tp'] = (data['High'] + data['Low'] + data['Close']) / 3
-data['vwap'] = (data['tp'] * data['Volume']).cumsum() / data['Volume'].cumsum()
+# Ensure columns are 1D (fix yfinance bug)
+data = data[['Open','High','Low','Close','Volume']].copy()
 
+# Convert to numeric just in case
+for col in ['Open','High','Low','Close','Volume']:
+    data[col] = pd.to_numeric(data[col], errors='coerce')
+
+# Drop bad rows
+data = data.dropna()
+
+# VWAP calculation (safe)
+tp = (data['High'] + data['Low'] + data['Close']) / 3
+vwap = (tp * data['Volume']).cumsum() / data['Volume'].cumsum()
+
+data['vwap'] = vwap
 latest = data.iloc[-1]
 prev = data.iloc[-2]
 
