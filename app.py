@@ -7,7 +7,23 @@ st.set_page_config(layout="wide")
 st.title("QQQ One-Screen Trading Dashboard")
 
 ticker = "QQQ"
-data = yf.download(ticker, period="1d", interval="1m").dropna()
+import time
+
+data = None
+
+for i in range(3):  # retry 3 times
+    try:
+        data = yf.download(ticker, period="1d", interval="1m")
+        if not data.empty:
+            break
+    except:
+        time.sleep(2)
+
+if data is None or data.empty:
+    st.error("⚠️ Failed to load market data. Refresh in a moment.")
+    st.stop()
+
+data = data.dropna()
 
 # Opening Range
 opening = data.between_time("09:30", "09:45")
