@@ -35,6 +35,10 @@ last_alert = ""
 last_trade_time = 0
 
 while True:
+send_alert("✅ TEST ALERT - SYSTEM IS LIVE")
+time.sleep(5)
+
+ 
     try:
         spy = get_data("SPY")
 
