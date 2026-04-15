@@ -1,53 +1,151 @@
-
-import yfinance as yf
-import pandas as pd
-import requests
 import time
+import pandas as pd
+import yfinance as yf
+import requests
+from datetime import datetime
+import os
 
-BOT_TOKEN = "PASTE_TOKEN"
-CHAT_ID = "PASTE_CHAT_ID"
+# ===== ENV VARIABLES =====
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
-trade_count = 0
-losses = 0
+# ===== SETTINGS =====
+RISK_PER_TRADE = 100   # change this to your risk level
 
-def send(msg):
+def send_alert(msg):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
+    try:
+        requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
+    except:
+        pass
 
-def run():
-    global trade_count
+def get_data(symbol):
+    for _ in range(3):
+        try:
+            df = yf.download(symbol, period="1d", interval="1m", progress=False)
+            if not df.empty:
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                return df.dropna()
+        except:
+            time.sleep(2)
+    return None
 
-    if trade_count >= 3:
-        send("STOP: Max trades hit")
-        return
-
-    data = yf.download("QQQ", period="1d", interval="1m").dropna()
-
-    opening = data.between_time("09:30","09:45")
-    or_high = opening["High"].max()
-    or_low = opening["Low"].min()
-
-    data['tp'] = (data['High']+data['Low']+data['Close'])/3
-    data['vwap'] = (data['tp']*data['Volume']).cumsum()/data['Volume'].cumsum()
-
-    latest = data.iloc[-1]
-    prev = data.iloc[-2]
-
-    price = latest["Close"]
-    vwap = latest["vwap"]
-
-    signal = None
-
-    if price > or_high and price > vwap:
-        signal = "CALL"
-    elif price < or_low and price < vwap:
-        signal = "PUT"
-
-    if signal:
-        msg = f"QQQ ALERT: BUY {signal} at {round(price,2)}"
-        send(msg)
-        trade_count += 1
+last_alert = ""
+last_trade_time = 0
 
 while True:
-    run()
-    time.sleep(60)
+    try:
+        spy = get_data("SPY")
+
+        if spy is None or len(spy) < 5:
+            time.sleep(60)
+            continue
+
+        now = datetime.now()
+
+        # ===== FIRST 90 MINUTES =====
+        if not (9 <= now.hour < 11):
+            time.sleep(60)
+            continue
+
+        # ===== OPENING RANGE =====
+        opening = spy.between_time("09:30", "09:45")
+        if opening.empty:
+            time.sleep(60)
+            continue
+
+        or_high = float(opening["High"].max())
+        or_low = float(opening["Low"].min())
+
+        # ===== VWAP =====
+        tp = (spy["High"] + spy["Low"] + spy["Close"]) / 3
+        spy["vwap"] = (tp * spy["Volume"]).cumsum() / spy["Volume"].cumsum()
+
+        latest = spy.iloc[-1]
+        prev = spy.iloc[-2]
+
+        price = float(latest["Close"])
+        vwap = float(latest["vwap"])
+
+        # ===== MOMENTUM =====
+        momentum = abs(price - float(prev["Close"]))
+
+        # ===== EXPECTED MOVE FILTER =====
+        expected_move = spy["Close"].std() * 2
+        move_from_open = abs(price - float(spy["Open"].iloc[0]))
+        valid_day = move_from_open > expected_move * 0.4
+
+        if not valid_day:
+            time.sleep(60)
+            continue
+
+        # ===== SIGNAL =====
+        signal = None
+
+        if price > or_high and price > vwap and momentum > 0.15:
+            signal = "XSP CALL 🚀"
+
+        elif price < or_low and price < vwap and momentum > 0.15:
+            signal = "XSP PUT 🔻"
+
+        if signal is None:
+            time.sleep(60)
+            continue
+
+        # ===== CONFIDENCE SCORE =====
+        score = 0
+
+        if price > or_high or price < or_low:
+            score += 30
+
+        if abs(price - vwap) > 0.25:
+            score += 25
+
+        if momentum > 0.2:
+            score += 25
+
+        if float(spy["Volume"].iloc[-1]) > float(spy["Volume"].mean()):
+            score += 20
+
+        confidence = min(score, 100)
+
+        # ===== A+ FILTER =====
+        if confidence < 85:
+            time.sleep(60)
+            continue
+
+        # ===== COOLDOWN =====
+        if time.time() - last_trade_time < 900:
+            time.sleep(60)
+            continue
+
+        # ===== MONEY MANAGEMENT =====
+        option_price = 1.5  # estimated XSP option price
+        contracts = max(1, int(RISK_PER_TRADE / (option_price * 100)))
+
+        target_pct = 50
+        stop_pct = 30
+
+        # ===== MESSAGE =====
+        msg = (
+            f"🚨 A+ {signal}\n"
+            f"Underlying: SPY\n"
+            f"SPY Price: {price:.2f}\n"
+            f"Confidence: {confidence}%\n\n"
+            f"💰 Size: {contracts} contracts\n"
+            f"🎯 Target: +{target_pct}%\n"
+            f"🛑 Stop: -{stop_pct}%\n\n"
+            f"Time: {now.strftime('%H:%M')}"
+        )
+
+        if msg != last_alert:
+            send_alert(msg)
+            last_alert = msg
+            last_trade_time = time.time()
+
+        time.sleep(60)
+
+    except Exception as e:
+        print("Error:", e)
+        time.sleep(60)
