@@ -1,150 +1,181 @@
+import os
 import time
+import requests
 import pandas as pd
 import yfinance as yf
-import requests
-from datetime import datetime
-import os
+from datetime import datetime, timedelta
 
-# ===== ENV VARIABLES =====
+# =========================
+# ENV VARIABLES
+# =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-# ===== SETTINGS =====
-RISK_PER_TRADE = 100   # change this to your risk level
-
-def send_alert(msg):
+def send_alert(message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    params = {"chat_id": CHAT_ID, "text": message}
     try:
-        requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
+        requests.get(url, params=params)
     except:
         pass
 
-def get_data(symbol):
-    for _ in range(3):
-        try:
-            df = yf.download(symbol, period="1d", interval="1m", progress=False)
-            if not df.empty:
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
-                return df.dropna()
-        except:
-            time.sleep(2)
-    return None
+# =========================
+# SETTINGS
+# =========================
+SYMBOL = "SPY"   # proxy for XSP
+INTERVAL = "1m"
 
-last_alert = ""
-last_trade_time = 0
+last_signal = None
+last_alert_time = 0
+ALERT_COOLDOWN = 900  # 15 minutes
 
+# =========================
+# TIME FILTER (FIRST 90 MIN)
+# =========================
+def market_open_filter():
+    now = datetime.utcnow() - timedelta(hours=4)  # EST
+    market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    cutoff = market_open + timedelta(minutes=90)
+    return market_open <= now <= cutoff
+
+# =========================
+# EXPECTED MOVE FILTER
+# =========================
+def expected_move_filter(data):
+    high = data["High"].max()
+    low = data["Low"].min()
+    current = data["Close"].iloc[-1]
+
+    if current > high * 0.995 or current < low * 1.005:
+        return False
+    return True
+
+# =========================
+# MAIN LOOP
+# =========================
 while True:
-
- 
     try:
-        spy = get_data("SPY")
-
-        if spy is None or len(spy) < 5:
+        if not market_open_filter():
             time.sleep(60)
             continue
 
-        now = datetime.now()
+        data = yf.download(SYMBOL, period="1d", interval=INTERVAL)
 
-        # ===== FIRST 90 MINUTES =====
-        if not (9 <= now.hour < 11):
+        if data.empty or len(data) < 20:
             time.sleep(60)
             continue
 
-        # ===== OPENING RANGE =====
-        opening = spy.between_time("09:30", "09:45")
-        if opening.empty:
-            time.sleep(60)
-            continue
+        # =========================
+        # VWAP
+        # =========================
+        data["tp"] = (data["High"] + data["Low"] + data["Close"]) / 3
+        data["vwap"] = (data["tp"] * data["Volume"]).cumsum() / data["Volume"].cumsum()
 
-        or_high = float(opening["High"].max())
-        or_low = float(opening["Low"].min())
+        price = data["Close"].iloc[-1]
+        prev = data.iloc[-2]
+        vwap = data["vwap"].iloc[-1]
 
-        # ===== VWAP =====
-        tp = (spy["High"] + spy["Low"] + spy["Close"]) / 3
-        spy["vwap"] = (tp * spy["Volume"]).cumsum() / spy["Volume"].cumsum()
+        # =========================
+        # MOMENTUM FILTER
+        # =========================
+        candle_body = abs(data["Close"] - data["Open"])
+        candle_range = data["High"] - data["Low"]
 
-        latest = spy.iloc[-1]
-        prev = spy.iloc[-2]
+        strong_candle = (candle_body / candle_range) > 0.6
 
-        price = float(latest["Close"])
-        vwap = float(latest["vwap"])
+        recent_high = data["High"].rolling(5).max()
+        recent_low = data["Low"].rolling(5).min()
 
-        # ===== MOMENTUM =====
-        momentum = abs(price - float(prev["Close"]))
+        breakout_up = price > recent_high.iloc[-2]
+        breakout_down = price < recent_low.iloc[-2]
 
-        # ===== EXPECTED MOVE FILTER =====
-        expected_move = spy["Close"].std() * 2
-        move_from_open = abs(price - float(spy["Open"].iloc[0]))
-        valid_day = move_from_open > expected_move * 0.4
+        avg_range = (data["High"] - data["Low"]).rolling(10).mean()
+        expansion = candle_range.iloc[-1] > avg_range.iloc[-1]
 
-        if not valid_day:
-            time.sleep(60)
-            continue
-
-        # ===== SIGNAL =====
-        signal = None
-
-        if price > or_high and price > vwap and momentum > 0.15:
-            signal = "XSP CALL 🚀"
-
-        elif price < or_low and price < vwap and momentum > 0.15:
-            signal = "XSP PUT 🔻"
-
-        if signal is None:
-            time.sleep(60)
-            continue
-
-        # ===== CONFIDENCE SCORE =====
-        score = 0
-
-        if price > or_high or price < or_low:
-            score += 30
-
-        if abs(price - vwap) > 0.25:
-            score += 25
-
-        if momentum > 0.2:
-            score += 25
-
-        if float(spy["Volume"].iloc[-1]) > float(spy["Volume"].mean()):
-            score += 20
-
-        confidence = min(score, 100)
-
-        # ===== A+ FILTER =====
-        if confidence < 85:
-            time.sleep(60)
-            continue
-
-        # ===== COOLDOWN =====
-        if time.time() - last_trade_time < 900:
-            time.sleep(60)
-            continue
-
-        # ===== MONEY MANAGEMENT =====
-        option_price = 1.5  # estimated XSP option price
-        contracts = max(1, int(RISK_PER_TRADE / (option_price * 100)))
-
-        target_pct = 50
-        stop_pct = 30
-
-        # ===== MESSAGE =====
-        msg = (
-            f"🚨 A+ {signal}\n"
-            f"Underlying: SPY\n"
-            f"SPY Price: {price:.2f}\n"
-            f"Confidence: {confidence}%\n\n"
-            f"💰 Size: {contracts} contracts\n"
-            f"🎯 Target: +{target_pct}%\n"
-            f"🛑 Stop: -{stop_pct}%\n\n"
-            f"Time: {now.strftime('%H:%M')}"
+        strong_momentum = (
+            strong_candle.iloc[-1]
+            and expansion
+            and (breakout_up or breakout_down)
         )
 
-        if msg != last_alert:
-            send_alert(msg)
-            last_alert = msg
-            last_trade_time = time.time()
+        # =========================
+        # RSI FILTER
+        # =========================
+        delta = data["Close"].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+
+        rs = gain / loss
+        data["rsi"] = 100 - (100 / (1 + rs))
+        rsi = data["rsi"].iloc[-1]
+
+        bullish_rsi = rsi > 60
+        bearish_rsi = rsi < 40
+        chop_rsi = 45 < rsi < 55
+
+        if chop_rsi:
+            time.sleep(60)
+            continue
+
+        # =========================
+        # EXPECTED MOVE FILTER
+        # =========================
+        if not expected_move_filter(data):
+            time.sleep(60)
+            continue
+
+        # =========================
+        # SIGNAL LOGIC
+        # =========================
+        setup_type = None
+        confidence = 0
+
+        # A+ setups
+        if price > vwap and prev["Close"] < prev["vwap"] and strong_momentum and bullish_rsi:
+            setup_type = "A+ CALL 🚀"
+            confidence = 95
+
+        elif price < vwap and prev["Close"] > prev["vwap"] and strong_momentum and bearish_rsi:
+            setup_type = "A+ PUT 🔻"
+            confidence = 95
+
+        # A setups
+        elif price > vwap and breakout_up and bullish_rsi:
+            setup_type = "A CALL ⚡"
+            confidence = 78
+
+        elif price < vwap and breakout_down and bearish_rsi:
+            setup_type = "A PUT ⚡"
+            confidence = 78
+
+        # =========================
+        # ALERT SYSTEM (NO DUPES)
+        # =========================
+        current_time = time.time()
+
+        if setup_type:
+            if setup_type == last_signal and (current_time - last_alert_time) < ALERT_COOLDOWN:
+                time.sleep(60)
+                continue
+
+            size = "2 contracts" if "A+" in setup_type else "1 contract"
+
+            message = f"""
+🚨 {setup_type}
+
+Confidence: {confidence}%
+
+💰 Size: {size}
+🎯 Target: +50%
+🛑 Stop: -30%
+"""
+
+            send_alert(message)
+
+            last_signal = setup_type
+            last_alert_time = current_time
+
+            time.sleep(300)
 
         time.sleep(60)
 
